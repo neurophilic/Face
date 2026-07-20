@@ -7,11 +7,17 @@ import os
 import urllib.request
 import shutil
 import time
+import tkinter as tk
+from tkinter import filedialog
 
 # --- 1. Application Config ---
-st.set_page_config(page_title="Local Photo Sorter", layout="wide")
-st.title("Desktop Photo Sorter 📸")
-st.markdown("Scans a local folder on your computer and automatically organizes photos by face.")
+st.set_page_config(page_title="Auto Face Discovery", layout="wide")
+st.title("Auto Face Discovery & Sorter 🤖")
+st.markdown("Select a folder. The AI will automatically find, group, and learn unique faces on its own.")
+
+# Initialize session state for the folder path
+if "folder_path" not in st.session_state:
+    st.session_state.folder_path = ""
 
 # --- 2. Guaranteed Model Initialization ---
 @st.cache_resource
@@ -33,16 +39,9 @@ if face_detector.empty():
     st.error("System Failure: Cascade classifier could not initialize.")
     st.stop()
 
-try:
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-except AttributeError:
-    st.error("System Failure: The cv2.face module is missing. Check your requirements.txt.")
-    st.stop()
-
 # --- 3. Image Processing Helpers ---
-def process_image_to_gray(image_path_or_buffer):
-    """Handles both uploaded file buffers and local file paths."""
-    img = Image.open(image_path_or_buffer).convert("L")
+def process_image_to_gray(image_path):
+    img = Image.open(image_path).convert("L")
     img.thumbnail((600, 600), Image.Resampling.BILINEAR)
     return np.array(img, dtype=np.uint8)
 
@@ -52,7 +51,6 @@ def extract_and_sanitize_face(gray_image, x, y, w, h):
     return roi.astype(np.uint8)
 
 def get_image_files(folder_path):
-    """Retrieves all valid images from a local folder."""
     valid_extensions = {".jpg", ".jpeg", ".png"}
     image_files = []
     if os.path.isdir(folder_path):
@@ -62,123 +60,134 @@ def get_image_files(folder_path):
     return image_files
 
 # --- 4. Sidebar & UI ---
-st.sidebar.header("1. Upload Targets")
-target_files = st.sidebar.file_uploader("Upload 1 clear face per person", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
-
-st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Algorithm Settings")
 MATCH_THRESHOLD = st.sidebar.slider(
     "Match Strictness", 
-    min_value=40, max_value=130, value=80,
-    help="Lower = Stricter. Higher = Looser."
+    min_value=40, max_value=120, value=75,
+    help="Lower = Stricter (creates more folders). Higher = Looser (groups more faces together)."
 )
+st.sidebar.caption("Because the AI is discovering faces blindly, adjusting this slider is key to getting perfect groupings.")
 
-st.header("2. Target Folder")
-# Using a local path input. 
-batch_folder_path = st.text_input(
-    "Enter the absolute path to the folder containing photos to sort:", 
-    placeholder="/Users/alle/Pictures/Batch"
-)
+# --- Folder Picker Logic ---
+st.header("1. Choose Directory")
 
-# --- 5. Training Phase ---
-@st.cache_resource
-def train_model(uploaded_files):
-    faces, ids, name_map = [], [], {}
-    for idx, file in enumerate(uploaded_files):
-        name_map[idx] = file.name.split('.')[0]
-        gray = process_image_to_gray(file)
-        detected = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-        
-        if len(detected) > 0:
-            x, y, w, h = detected[0] 
-            face_roi = extract_and_sanitize_face(gray, x, y, w, h)
-            faces.append(face_roi)
-            ids.append(idx)
-            
-        del gray
-        gc.collect()
-        
-    if faces:
-        recognizer.train(faces, np.array(ids))
-        return name_map
-    return None
+# The Native Folder Picker Button
+if st.button("➕ Select Folder to Scan", type="primary"):
+    # Create a hidden Tkinter root window
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True) # Force window to the front
+    
+    # Open the native OS folder picker
+    selected_folder = filedialog.askdirectory(master=root, title="Select Folder Containing Photos")
+    root.destroy()
+    
+    if selected_folder:
+        st.session_state.folder_path = selected_folder
 
-# --- 6. Execution Phase ---
-if target_files and batch_folder_path:
-    if not os.path.isdir(batch_folder_path):
-        st.warning("Please enter a valid directory path.")
+# Display chosen path
+if st.session_state.folder_path:
+    st.success(f"**Target Directory:** `{st.session_state.folder_path}`")
+else:
+    st.info("Click the button above to select a folder on your computer.")
+
+# --- 5. Execution Phase (Auto-Discovery) ---
+if st.session_state.folder_path and os.path.isdir(st.session_state.folder_path):
+    photos_to_sort = get_image_files(st.session_state.folder_path)
+    
+    if not photos_to_sort:
+        st.warning("No JPG or PNG files found in that folder.")
     else:
-        photos_to_sort = get_image_files(batch_folder_path)
+        st.write(f"Found **{len(photos_to_sort)}** images to scan.")
         
-        if not photos_to_sort:
-            st.warning("No JPG or PNG files found in that folder.")
-        else:
-            st.info(f"Found {len(photos_to_sort)} images to scan.")
+        if st.button("Start Auto-Discovery & Sort", use_container_width=True):
+            # Create a fresh recognizer for every new run
+            recognizer = cv2.face.LBPHFaceRecognizer_create()
+            is_trained = False
+            current_person_id = 1
             
-            name_dict = train_model(target_files)
+            output_base_dir = os.path.join(st.session_state.folder_path, "Auto_Sorted_Faces")
+            os.makedirs(output_base_dir, exist_ok=True)
             
-            if not name_dict:
-                st.error("No valid faces found in target images.")
-            else:
-                st.sidebar.success(f"Model trained on {len(name_dict)} profiles.")
+            # Dictionary to track which images belong to which Person ID
+            results = {"No_Faces_Detected": []} 
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            total_photos = len(photos_to_sort)
+            start_time = time.time()
+            
+            for i, photo_path in enumerate(photos_to_sort):
+                status_text.text(f"Scanning photo {i+1} of {total_photos}...")
+                gray = process_image_to_gray(photo_path)
+                detected = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
                 
-                if st.button("Start Scanning & Sorting", type="primary", use_container_width=True):
-                    start_time = time.time()
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    # Create the master output directory
-                    output_base_dir = os.path.join(batch_folder_path, "Sorted_Photos")
-                    os.makedirs(output_base_dir, exist_ok=True)
-                    
-                    results = {name: [] for name in name_dict.values()}
-                    results["Unknown_No_Match"] = []
-                    total_photos = len(photos_to_sort)
-                    
-                    for i, photo_path in enumerate(photos_to_sort):
-                        status_text.text(f"Scanning photo {i+1} of {total_photos}: {os.path.basename(photo_path)}")
+                if len(detected) == 0:
+                    results["No_Faces_Detected"].append(photo_path)
+                    dest = os.path.join(output_base_dir, "No_Faces_Detected")
+                    os.makedirs(dest, exist_ok=True)
+                    shutil.copy(photo_path, dest)
+                else:
+                    for (x, y, w, h) in detected:
+                        roi = extract_and_sanitize_face(gray, x, y, w, h)
+                        label_array = np.array([current_person_id], dtype=np.int32)
                         
-                        gray = process_image_to_gray(photo_path)
-                        detected = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-                        
-                        matched = False
-                        for (x, y, w, h) in detected:
-                            roi = extract_and_sanitize_face(gray, x, y, w, h)
+                        # If the model is completely empty, start by training it on the very first face
+                        if not is_trained:
+                            recognizer.train([roi], label_array)
+                            results[f"Person_{current_person_id}"] = [photo_path]
+                            
+                            # Copy file
+                            dest = os.path.join(output_base_dir, f"Person_{current_person_id}")
+                            os.makedirs(dest, exist_ok=True)
+                            shutil.copy(photo_path, dest)
+                            
+                            is_trained = True
+                            current_person_id += 1
+                        else:
                             try:
-                                label, distance = recognizer.predict(roi)
+                                # Ask the AI: Who is this?
+                                predicted_id, distance = recognizer.predict(roi)
+                                
                                 if distance < MATCH_THRESHOLD:
-                                    matched_name = name_dict[label]
-                                    results[matched_name].append(photo_path)
-                                    matched = True
+                                    # It's a match! Update the AI's memory of this person to make it smarter
+                                    recognizer.update([roi], np.array([predicted_id], dtype=np.int32))
+                                    person_key = f"Person_{predicted_id}"
                                     
-                                    # Copy file to destination folder
-                                    dest_folder = os.path.join(output_base_dir, matched_name)
-                                    os.makedirs(dest_folder, exist_ok=True)
-                                    shutil.copy(photo_path, dest_folder)
-                                    break 
+                                    if photo_path not in results.get(person_key, []):
+                                        if person_key not in results: results[person_key] = []
+                                        results[person_key].append(photo_path)
+                                        dest = os.path.join(output_base_dir, person_key)
+                                        os.makedirs(dest, exist_ok=True)
+                                        shutil.copy(photo_path, dest)
+                                else:
+                                    # New face discovered! Add them to the database
+                                    recognizer.update([roi], label_array)
+                                    person_key = f"Person_{current_person_id}"
+                                    results[person_key] = [photo_path]
+                                    
+                                    dest = os.path.join(output_base_dir, person_key)
+                                    os.makedirs(dest, exist_ok=True)
+                                    shutil.copy(photo_path, dest)
+                                    
+                                    current_person_id += 1
+                                    
                             except cv2.error:
                                 continue
                                 
-                        if not matched:
-                            results["Unknown_No_Match"].append(photo_path)
-                            dest_folder = os.path.join(output_base_dir, "Unknown_No_Match")
-                            os.makedirs(dest_folder, exist_ok=True)
-                            shutil.copy(photo_path, dest_folder)
-                            
-                        del gray
-                        gc.collect()
-                        progress_bar.progress((i + 1) / total_photos)
-                    
-                    elapsed_time = time.time() - start_time
-                    status_text.empty()
-                    progress_bar.empty()
-                    
-                    # --- 7. Metrics ---
-                    st.success(f"✅ Sorting Complete! Files saved to: `{output_base_dir}`")
-                    
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Total Processed", total_photos)
-                    m2.metric("Processing Time", f"{elapsed_time:.1f} sec")
-                    
-                    match_rate = ((total_photos - len(results["Unknown_No_Match"])) / total_photos) * 100
-                    m3.metric("Match Rate", f"{match_rate:.0f}%")
+                del gray
+                gc.collect()
+                progress_bar.progress((i + 1) / total_photos)
+            
+            elapsed_time = time.time() - start_time
+            status_text.empty()
+            progress_bar.empty()
+            
+            # --- 6. Metrics ---
+            st.success(f"✅ Discovery Complete! Faces sorted into `{output_base_dir}`")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Processed", total_photos)
+            m2.metric("Processing Time", f"{elapsed_time:.1f} sec")
+            
+            discovered_faces = current_person_id - 1
+            m3.metric("Unique People Discovered", discovered_faces)
