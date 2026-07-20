@@ -1,79 +1,95 @@
-import os
-import shutil
+import streamlit as st
 import face_recognition
-import cv2
+import numpy as np
+from PIL import Image
+import gc
+import io
 
-def load_reference_faces(reference_dir):
-    """Loads reference images to learn what each person looks like."""
-    known_encodings = []
-    known_names = []
+# Setup page configuration
+st.set_page_config(page_title="AI Photo Sorter", layout="wide")
+st.title("AI Photo Sorter 📸")
+
+# --- Sidebar: Reference Profiles ---
+st.sidebar.header("1. Upload Target Faces")
+st.sidebar.write("Upload one clear, front-facing photo for each person you want to sort.")
+target_files = st.sidebar.file_uploader("Target Faces", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
+
+# --- Main Page: Batch Photos ---
+st.header("2. Upload Photos to Sort")
+photos_to_sort = st.file_uploader("Batch Photos", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
+
+# Cache the target encodings to save memory upon Streamlit reruns
+@st.cache_resource
+def load_target_encodings(uploaded_targets):
+    encodings = []
+    names = []
+    for file in uploaded_targets:
+        image = face_recognition.load_image_file(file)
+        face_enc = face_recognition.face_encodings(image)
+        if len(face_enc) > 0:
+            encodings.append(face_enc[0])
+            names.append(file.name.split('.')[0]) # Uses filename as the person's name
+    return encodings, names
+
+if target_files and photos_to_sort:
+    target_encodings, target_names = load_target_encodings(target_files)
     
-    for filename in os.listdir(reference_dir):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-            filepath = os.path.join(reference_dir, filename)
-            image = face_recognition.load_image_file(filepath)
-            encodings = face_recognition.face_encodings(image)
+    if not target_encodings:
+        st.error("No faces were detected in the target images. Please try clearer photos.")
+    else:
+        st.success(f"Loaded {len(target_names)} target profiles into memory.")
+        
+        if st.button("Start Sorting"):
+            st.write("### Sorting Results")
             
-            if encodings:
-                # Use the filename (without extension) as the person's name
-                known_encodings.append(encodings[0])
-                name = os.path.splitext(filename)[0]
-                known_names.append(name.title())
-                
-    return known_encodings, known_names
-
-def sort_album(album_dir, output_dir, known_encodings, known_names):
-    """Scans the album and copies photos into named folders."""
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    for filename in os.listdir(album_dir):
-        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-            filepath = os.path.join(album_dir, filename)
-            image = face_recognition.load_image_file(filepath)
+            # Initialize a dictionary to hold the sorted output
+            sorted_photos = {name: [] for name in target_names}
+            sorted_photos["Unknown/No Match"] = []
             
-            # Find all faces in the current image
-            encodings = face_recognition.face_encodings(image)
-            found_names = set()
-
-            for encoding in encodings:
-                # Compare face to known faces
-                matches = face_recognition.compare_faces(known_encodings, encoding, tolerance=0.6)
+            progress_bar = st.progress(0)
+            
+            # Loop through each uploaded photo
+            for i, photo in enumerate(photos_to_sort):
+                # Load the current image
+                image = face_recognition.load_image_file(photo)
+                face_locations = face_recognition.face_locations(image)
+                face_encs = face_recognition.face_encodings(image, face_locations)
                 
-                if True in matches:
-                    first_match_index = matches.index(True)
-                    name = known_names[first_match_index]
-                    found_names.add(name)
-
-            # If no known faces are found, put it in "Unknown"
-            if not found_names:
-                found_names.add("Unknown")
-
-            # Copy the image to the respective folder(s)
-            for name in found_names:
-                person_dir = os.path.join(output_dir, name)
-                if not os.path.exists(person_dir):
-                    os.makedirs(person_dir)
+                matched = False
+                for face_encoding in face_encs:
+                    # Compare against known targets with a strict tolerance
+                    matches = face_recognition.compare_faces(target_encodings, face_encoding, tolerance=0.5)
+                    
+                    if True in matches:
+                        first_match_index = matches.index(True)
+                        matched_name = target_names[first_match_index]
+                        sorted_photos[matched_name].append(photo)
+                        matched = True
+                        break 
                 
-                shutil.copy(filepath, os.path.join(person_dir, filename))
-                print(f"[SUCCESS] Copied {filename} to {name}'s folder.")
-
-if __name__ == "__main__":
-    print("=========================================")
-    print("        AI PHOTO ALBUM SORTER            ")
-    print("=========================================")
-    print("Note: Use absolute paths (e.g., C:/Photos/Album)\n")
-    
-    ref_dir = input("1. Enter path to 'Reference Faces' folder: ").strip('\"\'')
-    album_dir = input("2. Enter path to 'Unsorted Album' folder: ").strip('\"\'')
-    out_dir = input("3. Enter path for the 'Sorted Output' folder: ").strip('\"\'')
-
-    print("\n[INFO] Loading reference faces...")
-    encodings, names = load_reference_faces(ref_dir)
-    print(f"[INFO] Learned {len(names)} faces: {', '.join(names)}")
-
-    print("\n[INFO] Scanning and sorting album...")
-    sort_album(album_dir, out_dir, encodings, names)
-    
-    print("\n[DONE] Sorting complete!")
-    input("Press Enter to exit.")
+                if not matched:
+                     sorted_photos["Unknown/No Match"].append(photo)
+                
+                # CRITICAL: Force garbage collection to prevent cloud RAM overflow limits
+                del image
+                del face_locations
+                del face_encs
+                gc.collect()
+                
+                # Update visual progress
+                progress_bar.progress((i + 1) / len(photos_to_sort))
+                
+            st.success("Sorting Complete!")
+            
+            # Display the sorted categories
+            for name, photos in sorted_photos.items():
+                if photos:
+                    st.subheader(f"{name} ({len(photos)} photos)")
+                    cols = st.columns(min(len(photos), 5))
+                    
+                    # Display a preview of the sorted photos
+                    for idx, p in enumerate(photos[:5]): 
+                        p.seek(0)
+                        cols[idx].image(Image.open(p), use_container_width=True)
+                    if len(photos) > 5:
+                        st.write(f"*...and {len(photos) - 5} more*")
