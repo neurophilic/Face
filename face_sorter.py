@@ -3,136 +3,83 @@ import cv2
 import numpy as np
 from PIL import Image
 import gc
-import cv2
+import os
 
-# Ensure the path is constructed correctly
-cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+# --- Page Config ---
+st.set_page_config(page_title="Lightweight Face Sorter", layout="wide")
+st.title("AI Photo Sorter 📸")
 
-# Check if the path actually exists
-face_detector = cv2.CascadeClassifier(cascade_path)
+# --- Initialize Cascade ---
+# Using the local file we bundled in the folder
+CASCADE_FILE = "haarcascade_frontalface_default.xml"
 
-if face_detector.empty():
-    raise IOError("Failed to load Haar cascade file. Check your OpenCV installation.")
-st.set_page_config(page_title="Lightweight Face Sorter", layout="wide", initial_sidebar_state="expanded")
-st.title("AI Photo Sorter 📸 (Zero-Dependency Version)")
+if not os.path.exists(CASCADE_FILE):
+    st.error(f"Missing {CASCADE_FILE} in your folder. Please upload it to your repo.")
+    st.stop()
 
-# --- Initialize Classic Computer Vision Tools ---
-# 1. Haar Cascade for detecting where the face is
-cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-face_detector = cv2.CascadeClassifier(cascade_path)
-
-# 2. LBPH Recognizer for identifying who the face belongs to
+face_detector = cv2.CascadeClassifier(CASCADE_FILE)
+# LBPH recognizer (requires opencv-contrib-python-headless)
 recognizer = cv2.face.LBPHFaceRecognizer_create()
 
 def process_image_to_gray(file_buffer):
-    """Converts uploaded file directly to grayscale numpy array for OpenCV."""
-    img = Image.open(file_buffer).convert("L")  # 'L' mode is Grayscale
-    
-    # Scale down to prevent RAM spikes on massive photos
-    img.thumbnail((800, 800), Image.Resampling.BILINEAR)
+    img = Image.open(file_buffer).convert("L")
+    img.thumbnail((600, 600), Image.Resampling.BILINEAR)
     return np.array(img, dtype='uint8')
 
-# --- Sidebar: Reference Profiles ---
+# --- Sidebar Inputs ---
 st.sidebar.header("1. Upload Target Faces")
-st.sidebar.write("Upload 1 clear, front-facing photo per person.")
-target_files = st.sidebar.file_uploader("Target Faces", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
+target_files = st.sidebar.file_uploader("Upload 1 photo per person", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
 
-st.header("2. Upload Photos to Sort")
-photos_to_sort = st.file_uploader("Batch Photos", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
+st.header("2. Upload Batch")
+photos_to_sort = st.file_uploader("Upload photos to sort", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
 
 @st.cache_resource
-def train_recognizer(uploaded_targets):
-    """Trains the LBPH algorithm from scratch based on uploaded targets."""
-    faces = []
-    ids = []
-    name_map = {}
-    
-    for idx, file in enumerate(uploaded_targets):
+def train_model(uploaded_files):
+    faces, ids, name_map = [], [], {}
+    for idx, file in enumerate(uploaded_files):
         name_map[idx] = file.name.split('.')[0]
-        gray_image = process_image_to_gray(file)
-        
-        # Detect the face
-        detected = face_detector.detectMultiScale(gray_image, scaleFactor=1.1, minNeighbors=5)
-        
+        gray = process_image_to_gray(file)
+        detected = face_detector.detectMultiScale(gray, 1.1, 5)
         if len(detected) > 0:
-            # Take the first face found
             x, y, w, h = detected[0]
-            # Crop to just the face
-            face_roi = gray_image[y:y+h, x:x+w]
-            # Standardize size for the AI model
-            face_roi = cv2.resize(face_roi, (200, 200))
-            
+            face_roi = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
             faces.append(face_roi)
             ids.append(idx)
-            
-        del gray_image
-        gc.collect()
-        
-    if len(faces) > 0:
-        # Train the model from scratch!
+    if faces:
         recognizer.train(faces, np.array(ids))
-        return True, name_map
-    else:
-        return False, {}
+        return name_map
+    return None
 
-# --- Main Logic ---
 if target_files and photos_to_sort:
-    is_trained, name_dictionary = train_recognizer(target_files)
+    name_dict = train_model(target_files)
     
-    if not is_trained:
-        st.error("Could not find clear faces in the Target images. Try different photos.")
-    else:
-        st.sidebar.success(f"Trained model on {len(name_dictionary)} targets.")
+    if name_dict and st.button("Start Sorting"):
+        results = {name: [] for name in name_dict.values()}
+        results["Unknown"] = []
         
-        if st.button("Start Sorting", type="primary"):
-            status_text = st.empty()
-            progress_bar = st.progress(0)
+        progress = st.progress(0)
+        for i, photo in enumerate(photos_to_sort):
+            gray = process_image_to_gray(photo)
+            detected = face_detector.detectMultiScale(gray, 1.1, 5)
             
-            sorted_photos = {name: [] for name in name_dictionary.values()}
-            sorted_photos["Unknown/No Match"] = []
-            
-            total_photos = len(photos_to_sort)
-            
-            # Distance threshold (Lower means a stricter match. 70-80 is standard for LBPH)
-            MATCH_THRESHOLD = 80  
-            
-            for i, photo in enumerate(photos_to_sort):
-                status_text.text(f"Processing image {i+1} of {total_photos}...")
+            matched = False
+            for (x, y, w, h) in detected:
+                roi = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+                label, dist = recognizer.predict(roi)
                 
-                gray_image = process_image_to_gray(photo)
-                detected_faces = face_detector.detectMultiScale(gray_image, scaleFactor=1.1, minNeighbors=5)
-                
-                matched = False
-                for (x, y, w, h) in detected_faces:
-                    face_roi = cv2.resize(gray_image[y:y+h, x:x+w], (200, 200))
-                    
-                    # Predict using our trained model
-                    predicted_id, distance = recognizer.predict(face_roi)
-                    
-                    if distance < MATCH_THRESHOLD:
-                        matched_name = name_dictionary[predicted_id]
-                        sorted_photos[matched_name].append(photo)
-                        matched = True
-                        break # Stop looking at other faces in this photo once matched
-                
-                if not matched:
-                    sorted_photos["Unknown/No Match"].append(photo)
-                    
-                del gray_image
-                gc.collect()
-                progress_bar.progress((i + 1) / total_photos)
-                
-            status_text.success("Sorting Complete!")
+                if dist < 80: # Threshold
+                    results[name_dict[label]].append(photo)
+                    matched = True
+                    break
             
-            # Render Results
-            for name, photos in sorted_photos.items():
-                if photos:
-                    st.subheader(f"{name} ({len(photos)} photos)")
-                    cols = st.columns(min(len(photos), 5))
-                    
-                    for idx, p in enumerate(photos[:5]): 
-                        p.seek(0)
-                        cols[idx].image(p, use_container_width=True)
-                    
-                    if len(photos) > 5:
-                        st.write(f"*...and {len(photos) - 5} more*")
+            if not matched: results["Unknown"].append(photo)
+            progress.progress((i + 1) / len(photos_to_sort))
+            
+        # Display
+        for name, photos in results.items():
+            if photos:
+                st.subheader(f"{name} ({len(photos)})")
+                cols = st.columns(min(len(photos), 5))
+                for j, p in enumerate(photos[:5]):
+                    p.seek(0)
+                    cols[j].image(p, use_container_width=True)
