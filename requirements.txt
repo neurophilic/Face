@@ -1,5 +1,5 @@
-streamlit
-face_recognition
+cmake
+dlib
+face-recognition
 opencv-python-headless
-
-
+streamlit
