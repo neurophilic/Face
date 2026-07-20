@@ -1,2 +1,7 @@
+
+streamlit
+opencv-python-headless
 cmake
+Pillow
+numpy
 face_recognition @ git+https://github.com/thetoby9944/face_recognition
