@@ -1,114 +1,121 @@
 import streamlit as st
-import face_recognition
+import cv2
 import numpy as np
 from PIL import Image
 import gc
 
-st.set_page_config(page_title="AI Photo Sorter", layout="wide", initial_sidebar_state="expanded")
-st.title("AI Photo Sorter 📸")
+st.set_page_config(page_title="Lightweight Face Sorter", layout="wide", initial_sidebar_state="expanded")
+st.title("AI Photo Sorter 📸 (Zero-Dependency Version)")
 
-# --- Ultra-Fast Image Loader & Resizer ---
-def process_and_resize_image(file_buffer, max_size=600):
-    """
-    Downsamples image to max 600px on the longest side.
-    600px is the sweet spot for rapid face detection without losing accuracy.
-    """
-    img = Image.open(file_buffer).convert("RGB")
+# --- Initialize Classic Computer Vision Tools ---
+# 1. Haar Cascade for detecting where the face is
+cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+face_detector = cv2.CascadeClassifier(cascade_path)
+
+# 2. LBPH Recognizer for identifying who the face belongs to
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+
+def process_image_to_gray(file_buffer):
+    """Converts uploaded file directly to grayscale numpy array for OpenCV."""
+    img = Image.open(file_buffer).convert("L")  # 'L' mode is Grayscale
     
-    # Fast resize using bilinear interpolation
-    img.thumbnail((max_size, max_size), Image.Resampling.BILINEAR)
-    return np.asarray(img)
+    # Scale down to prevent RAM spikes on massive photos
+    img.thumbnail((800, 800), Image.Resampling.BILINEAR)
+    return np.array(img, dtype='uint8')
 
 # --- Sidebar: Reference Profiles ---
 st.sidebar.header("1. Upload Target Faces")
-st.sidebar.write("Upload 1 clear face photo per person.")
+st.sidebar.write("Upload 1 clear, front-facing photo per person.")
 target_files = st.sidebar.file_uploader("Target Faces", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
 
 st.header("2. Upload Photos to Sort")
 photos_to_sort = st.file_uploader("Batch Photos", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
 
 @st.cache_resource
-def load_target_encodings(uploaded_targets):
-    encodings = []
-    names = []
-    for file in uploaded_targets:
-        rgb_image = process_and_resize_image(file, max_size=600)
+def train_recognizer(uploaded_targets):
+    """Trains the LBPH algorithm from scratch based on uploaded targets."""
+    faces = []
+    ids = []
+    name_map = {}
+    
+    for idx, file in enumerate(uploaded_targets):
+        name_map[idx] = file.name.split('.')[0]
+        gray_image = process_image_to_gray(file)
         
-        # upsample=0 skips image enlargement (huge speed boost)
-        locations = face_recognition.face_locations(rgb_image, number_of_times_to_upsample=0, model="hog")
+        # Detect the face
+        detected = face_detector.detectMultiScale(gray_image, scaleFactor=1.1, minNeighbors=5)
         
-        if locations:
-            face_enc = face_recognition.face_encodings(rgb_image, known_face_locations=locations, num_jitters=1)
-            if face_enc:
-                encodings.append(face_enc[0])
-                names.append(file.name.split('.')[0])
-                
-        del rgb_image
+        if len(detected) > 0:
+            # Take the first face found
+            x, y, w, h = detected[0]
+            # Crop to just the face
+            face_roi = gray_image[y:y+h, x:x+w]
+            # Standardize size for the AI model
+            face_roi = cv2.resize(face_roi, (200, 200))
+            
+            faces.append(face_roi)
+            ids.append(idx)
+            
+        del gray_image
         gc.collect()
         
-    return np.array(encodings) if encodings else None, names
-
-if target_files and photos_to_sort:
-    target_encodings, target_names = load_target_encodings(target_files)
-    
-    if target_encodings is None or len(target_encodings) == 0:
-        st.error("No faces were detected in the target images. Please upload clearer photos.")
+    if len(faces) > 0:
+        # Train the model from scratch!
+        recognizer.train(faces, np.array(ids))
+        return True, name_map
     else:
-        st.sidebar.success(f"Loaded {len(target_names)} target profiles.")
+        return False, {}
+
+# --- Main Logic ---
+if target_files and photos_to_sort:
+    is_trained, name_dictionary = train_recognizer(target_files)
+    
+    if not is_trained:
+        st.error("Could not find clear faces in the Target images. Try different photos.")
+    else:
+        st.sidebar.success(f"Trained model on {len(name_dictionary)} targets.")
         
         if st.button("Start Sorting", type="primary"):
             status_text = st.empty()
             progress_bar = st.progress(0)
             
-            sorted_photos = {name: [] for name in target_names}
+            sorted_photos = {name: [] for name in name_dictionary.values()}
             sorted_photos["Unknown/No Match"] = []
             
             total_photos = len(photos_to_sort)
             
-            # Match threshold (0.50 is standard; lower = stricter match)
-            MATCH_THRESHOLD = 0.50 
-
+            # Distance threshold (Lower means a stricter match. 70-80 is standard for LBPH)
+            MATCH_THRESHOLD = 80  
+            
             for i, photo in enumerate(photos_to_sort):
-                # Throttle progress bar updates to save WebSocket/UI rendering overhead
-                if i % max(1, total_photos // 20) == 0 or i == total_photos - 1:
-                    status_text.text(f"Processing image {i+1} of {total_photos}...")
-                    progress_bar.progress((i + 1) / total_photos)
+                status_text.text(f"Processing image {i+1} of {total_photos}...")
                 
-                # Resize image
-                small_image = process_and_resize_image(photo, max_size=600)
+                gray_image = process_image_to_gray(photo)
+                detected_faces = face_detector.detectMultiScale(gray_image, scaleFactor=1.1, minNeighbors=5)
                 
-                # 1. Detect locations (upsample=0)
-                face_locations = face_recognition.face_locations(small_image, number_of_times_to_upsample=0, model="hog")
-                
-                # 2. Skip encoding entirely if no faces exist in the photo
-                if face_locations:
-                    face_encs = face_recognition.face_encodings(small_image, known_face_locations=face_locations, num_jitters=1)
+                matched = False
+                for (x, y, w, h) in detected_faces:
+                    face_roi = cv2.resize(gray_image[y:y+h, x:x+w], (200, 200))
                     
-                    matched = False
-                    for face_encoding in face_encs:
-                        # Vectorized Euclidean Distance calculation (Fast C-Level Math)
-                        distances = face_recognition.face_distance(target_encodings, face_encoding)
-                        best_match_idx = np.argmin(distances)
-                        
-                        if distances[best_match_idx] <= MATCH_THRESHOLD:
-                            matched_name = target_names[best_match_idx]
-                            sorted_photos[matched_name].append(photo)
-                            matched = True
-                            break # Found the closest target for this photo
-                            
-                    if not matched:
-                        sorted_photos["Unknown/No Match"].append(photo)
-                else:
-                    sorted_photos["Unknown/No Match"].append(photo)
+                    # Predict using our trained model
+                    predicted_id, distance = recognizer.predict(face_roi)
+                    
+                    if distance < MATCH_THRESHOLD:
+                        matched_name = name_dictionary[predicted_id]
+                        sorted_photos[matched_name].append(photo)
+                        matched = True
+                        break # Stop looking at other faces in this photo once matched
                 
-                # Free memory immediately
-                del small_image
-                del face_locations
+                if not matched:
+                    sorted_photos["Unknown/No Match"].append(photo)
+                    
+                del gray_image
                 gc.collect()
+                progress_bar.progress((i + 1) / total_photos)
                 
             status_text.success("Sorting Complete!")
             
-            # Render Results Grid
+            # Render Results
             for name, photos in sorted_photos.items():
                 if photos:
                     st.subheader(f"{name} ({len(photos)} photos)")
