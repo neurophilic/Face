@@ -1,2 +1,2 @@
-cmake
-face_recognition @ git+https://github.com/thetoby9944/face_recognition
+libgl1-mesa-glx
+libgtk-3-dev
