@@ -1,4 +1,2 @@
-build-essential
 cmake
-libgl1-mesa-glx
-libgtk-3-dev
+face_recognition @ git+https://github.com/thetoby9944/face_recognition
