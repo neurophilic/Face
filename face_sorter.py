@@ -3,7 +3,16 @@ import cv2
 import numpy as np
 from PIL import Image
 import gc
+import cv2
 
+# Ensure the path is constructed correctly
+cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+
+# Check if the path actually exists
+face_detector = cv2.CascadeClassifier(cascade_path)
+
+if face_detector.empty():
+    raise IOError("Failed to load Haar cascade file. Check your OpenCV installation.")
 st.set_page_config(page_title="Lightweight Face Sorter", layout="wide", initial_sidebar_state="expanded")
 st.title("AI Photo Sorter 📸 (Zero-Dependency Version)")
 
