@@ -1,5 +1,2 @@
 cmake
-dlib
-face-recognition
-opencv-python-headless
-streamlit
+face_recognition @ git+https://github.com/thetoby9944/face_recognition
